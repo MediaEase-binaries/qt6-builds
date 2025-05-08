@@ -1,0 +1,263 @@
+name: Build Qt6
+
+permissions: write-all
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'matrix.py'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Qt6 version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '6.5.5'
+          - '6.8.0'
+          - '6.9.0'
+
+jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generating matrix
+        id: generate
+        run: |
+          pip3 install --upgrade pyyaml
+          echo "Generating matrix..."
+          MATRIX=$(python3 matrix.py)
+          echo "$MATRIX" > matrix.json
+          echo "matrix<<EOF" >> $GITHUB_ENV
+          cat matrix.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup matrix
+        id: set
+        uses: druzsan/setup-matrix@v2
+        with:
+          matrix: |
+            ${{ env.matrix }}
+
+  build:
+    name: v${{ matrix.version }} (${{ matrix.os }})
+    needs: setup-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    container:
+      image: ${{ 
+        startsWith(matrix.os, 'debian-') && (matrix.os == 'debian-11' && 'debian:bullseye' || matrix.os == 'debian-12' && 'debian:bookworm' || 'debian:bookworm') ||
+        startsWith(matrix.os, 'ubuntu-') && format('{0}:{1}', 'ubuntu', matrix.os == 'ubuntu-latest' && 'noble' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'ubuntu-24.04' && '24.04' || matrix.os) || '' }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMMITTER_NAME: ${{ secrets.COMMITTER_NAME }}
+      COMMITTER_EMAIL: ${{ secrets.COMMITTER_EMAIL }}
+
+    steps:
+      - name: Setup variables
+        id: vars
+        run: |
+          echo "build_script=tools/packages/qt6/build.sh" >> $GITHUB_OUTPUT
+          echo "package_name=qt6" >> $GITHUB_OUTPUT
+          echo "metadata_script=tools/generate_metadata.sh" >> $GITHUB_OUTPUT
+          echo "control_file=tools/packages/qt6/control" >> $GITHUB_OUTPUT
+          echo "package_script=tools/generate_package.sh" >> $GITHUB_OUTPUT
+          echo "temp_dir=/tmp/qt6-build/install" >> $GITHUB_OUTPUT
+          for script in $(find tools/ -name "*.sh"); do
+            chmod +x $script
+          done
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout tools repository
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          path: tools
+
+      - name: Update APT
+        run: |
+          upx="upx-ucl"
+          if [ "${{ matrix.os }}" = "debian-12" ]; then
+            echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list
+            upx="upx-ucl/bookworm-backports"
+          fi
+          apt-get update
+          apt-get install -y apt-transport-https rsync lsb-release curl wget git gzip util-linux \
+            dirmngr software-properties-common gnupg2 ca-certificates gpg-agent dos2unix nfs-common \
+            jq sudo debconf-utils build-essential checkinstall libnss3-tools nano zip \
+            unzip ssl-cert openssl cmake ninja-build pkg-config \
+            libdouble-conversion-dev libpcre2-dev libzstd-dev libicu-dev \
+            libssl-dev zlib1g-dev upx-ucl
+
+      - name: Clean output and artifacts
+        run: |
+          rm -rf output artifacts
+          mkdir -p output artifacts
+
+      - name: Build Qt6
+        id: build
+        run: |
+          sed -i "s/@MAINTAINER@/${{ secrets.COMMITTER_NAME }} <${{ secrets.COMMITTER_EMAIL }}>/" ${{ steps.vars.outputs.control_file }}
+          chmod +x ${{ steps.vars.outputs.build_script }}
+          ./${{ steps.vars.outputs.build_script }} ${{ matrix.version }}
+          echo "compiled=true" >> $GITHUB_OUTPUT
+
+      - name: Generate metadata
+        if: steps.build.outputs.compiled == 'true'
+        run: |
+          deb=$(find / -name "qt6_*.deb")
+          mkdir -p artifacts
+          cp "$deb" artifacts/
+          cd artifacts
+          ../${{ steps.vars.outputs.metadata_script }} \
+            --category "qt6" \
+            --version "${{ matrix.version }}" \
+            "$(basename "$deb")"
+          ls -l
+
+      - name: Upload as Artifact
+        if: steps.build.outputs.compiled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt6-${{ matrix.version }}-${{ matrix.os }}
+          path: artifacts/*
+          retention-days: 7
+
+  release:
+    name: Create Releases
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ['6.5.5', '6.8.0', '6.9.0']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          pattern: qt6-*${{ matrix.version }}*
+      - name: Prepare release assets
+        id: prepare
+        run: |
+          mkdir -p release_assets
+          find release_assets -type f ! -name "*.deb" ! -name "*.json" -delete
+          find release_assets -type f -name "*.deb" -exec mv {} release_assets/ \;
+          TEMP_DIR=$(mktemp -d)
+          PACKAGES_TABLE="$TEMP_DIR/packages.md"
+          CONFIG_TABLE="$TEMP_DIR/config.md"
+          {
+            echo "| Package | OS | Qt Version |"
+            echo "| ------- | -- | ---------- |"
+            for f in release_assets/*.deb; do
+              if [ -f "$f" ]; then
+                pkg=$(basename "$f")
+                os=$(echo "$pkg" | grep -o "debian-[^ _]*\|ubuntu-[^ _]*" || echo "unknown")
+                echo "| $pkg | $os | ${{ matrix.version }} |"
+              fi
+            done
+          } > "$PACKAGES_TABLE"
+
+          {
+            qt_base_cmake_cmd='-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DQT_FEATURE_optimize_full=on -DQT_FEATURE_gui=off -DQT_FEATURE_openssl_linked=on -DQT_FEATURE_dbus=off -DQT_FEATURE_system_pcre2=off -DQT_FEATURE_widgets=off -DQT_FEATURE_testlib=off -DQT_BUILD_EXAMPLES=off -DQT_BUILD_TESTS=off'
+            qt_tools_cmake_cmd=' cmake -Wno-dev -Wno-deprecated -G Ninja -B build -D CMAKE_BUILD_TYPE="release" -D CMAKE_CXX_STANDARD=17 -D CMAKE_PREFIX_PATH="$INSTALL_DIR/usr" -D CMAKE_INSTALL_PREFIX=/usr'
+            echo "| Packages | CMake Command |"
+            echo "| -------- | ------------- |"
+            echo "| QtBase | \`${qt_base_cmake_cmd}\` |"
+            echo "| QtTools | \`${qt_tools_cmake_cmd}\` |"
+          } > "$CONFIG_TABLE"
+          echo "packages_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$PACKAGES_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "config_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$CONFIG_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          ls -la release_assets/
+          rm -rf "$TEMP_DIR"
+          if [[ ${{ matrix.version }} == *"rc"* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          if [[ -z "$(ls release_assets/*.deb 2>/dev/null)" ]]; then
+            echo "skip_release=true" >> $GITHUB_OUTPUT
+            echo "No packages to release"
+            ls -lah release_assets/
+          else
+            echo "skip_release=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Create Release
+        if: steps.prepare.outputs.skip_release == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ matrix.version }}
+          name: Qt6 ${{ matrix.version }}
+          files: |
+            release_assets/*
+          draft: false
+          prerelease: ${{ steps.prepare.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            # Qt6 v${{ matrix.version }}
+
+            Pre-built Qt6 libraries and tools packages for various Linux distributions.
+
+            ## 🎯 Features
+
+            - Pre-compiled Qt6 libraries and tools
+            - Multiple distribution support
+            - Automated builds via GitHub Actions
+            - JSON metadata for automated installations
+            - Optimized for MediaEase applications
+
+            ## 📦 Available Packages
+
+            ${{ steps.prepare.outputs.packages_table }}
+
+            ## 🔧 Build Configuration
+
+            ${{ steps.prepare.outputs.config_table }}
+
+            ## 📋 Installation
+
+            ### Manual Installation
+            1. Download the appropriate .deb package for your distribution
+            2. Install using: `sudo dpkg -i package_name.deb`
+            3. Fix any dependencies if needed: `sudo apt-get install -f`
+
+            ## 🔍 Package Details
+
+            The packages include:
+            - Qt6 Core libraries
+            - Qt6 Network libraries
+            - Qt6 Tools (qmake, uic, rcc, etc.)
+            - System-wide installation in `/usr`
+            - Optimized for minimal dependencies
+
+            ## 📄 Metadata
+
+            Each package is accompanied by its JSON metadata file containing:
+            - Package information
+            - Checksums
+            - Dependencies
+            - Build configuration
+            - Distribution details
+
+            ## 📝 License
+
+            Qt6 is distributed under the [GNU Lesser General Public License v3.0](https://www.gnu.org/licenses/lgpl-3.0.html) (LGPL-3.0).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
